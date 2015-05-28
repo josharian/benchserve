@@ -25,13 +25,34 @@
 // on stdout, and prints errors on stderr.
 //
 // It is designed to be invoked and driven by another program,
-// but you can take a quick tour by hand.
-// Type 'help' to see a list of commands.
-// Type 'list' to see a list of available benchmarks, one per line,
-// with a trailing blank line to indicate that the list is complete.
-// Type 'run BenchmarkName 50' to run BenchmarkName for 50 iterations.
-// Type 'run BenchmarkName-3 50' to run BenchmarkName for 50 iterations with GOMAXPROCS=3.
-// Type 'set benchmem true' to turn on memory benchmarking.
+// but you can take a quick tour by hand. Here is a sample session:
+//
+// 	$ cd $GOROOT/src/encoding/json
+// 	$ go test -c
+// 	$ ./json.test -test.benchserve
+// 	help
+// 	commands: help, list, run, set, quit, exit
+// 	list
+// 	BenchmarkCodeEncoder
+// 	BenchmarkCodeMarshal
+// 	BenchmarkCodeDecoder
+// 	BenchmarkCodeUnmarshal
+// 	BenchmarkCodeUnmarshalReuse
+// 	BenchmarkUnmarshalString
+// 	BenchmarkUnmarshalFloat64
+// 	BenchmarkUnmarshalInt64
+// 	BenchmarkSkipValue
+// 	BenchmarkEncoderEncode
+//
+// 	run BenchmarkCodeEncoder 100
+// 	BenchmarkCodeEncoder	     100	  17719109 ns/op	 109.51 MB/s
+// 	set benchmem true
+// 	run BenchmarkCodeEncoder 100
+// 	BenchmarkCodeEncoder	     100	  17974625 ns/op	 107.96 MB/s	   45953 B/op	       1 allocs/op
+// 	run BenchmarkCodeEncoder-4 100
+// 	BenchmarkCodeEncoder-4	     100	  18031952 ns/op	 107.61 MB/s	   45979 B/op	       1 allocs/op
+// 	exit
+// 	$
 //
 // The decision to use a simple, line-oriented server using pipes is intentional.
 // This enables benchserve to rely only on the same set of packages that
