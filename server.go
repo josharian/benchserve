@@ -266,14 +266,14 @@ func benchmarkName(name string, n int) string {
 	return name
 }
 
-type Result struct {
+type result struct {
 	testing.BenchmarkResult
 	Failed          bool
 	ShowAllocResult bool
 }
 
 // runBenchmark runs b for the specified number of iterations.
-func runBenchmark(b testing.InternalBenchmark, n int) Result {
+func runBenchmark(b testing.InternalBenchmark, n int) result {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	tb := testing.B{N: n}
@@ -293,7 +293,7 @@ func runBenchmark(b testing.InternalBenchmark, n int) Result {
 	wg.Wait()
 
 	v := reflect.ValueOf(tb)
-	var r Result
+	var r result
 	r.N = n
 	r.T = time.Duration(v.FieldByName("duration").Int())
 	r.Bytes = v.FieldByName("bytes").Int()
