@@ -54,6 +54,9 @@
 // 	exit
 // 	$
 //
+// The github.com/josharian/benchserve/benchcli package is a Go client
+// for benchserve.
+//
 // The decision to use a simple, line-oriented server using pipes is intentional.
 // This enables benchserve to rely only on the same set of packages that
 // the testing package does, which means that it is usable with any package
@@ -81,25 +84,56 @@ import (
 	"unsafe"
 )
 
-func Main(m *testing.M) {
-	benchserve := flag.Bool("test.benchserve", false, "run an interactive benchmark server")
-	flag.Parse()
-	if !*benchserve {
-		os.Exit(m.Run())
-	}
+var benchserve = flag.Bool("test.benchserve", false, "run an interactive benchmark server")
 
-	s := server{benchmarks: extractBenchmarks(m)}
-	s.serve()
+// Main runs a test binary.
+// To incorporate benchserve into your package,
+// add this TestMain function:
+//
+// 	func TestMain(m *testing.M) {
+// 		benchserve.Main(m)
+// 	}
+//
+// If your package already has a TestMain, use Serve.
+func Main(m *testing.M) {
+	flag.Parse()
+	Serve(m)
+	os.Exit(m.Run())
 }
 
-func extractBenchmarks(m *testing.M) []testing.InternalBenchmark {
-	v := reflect.ValueOf(m).Elem().FieldByName("benchmarks")
-	return *(*[]testing.InternalBenchmark)(unsafe.Pointer(v.UnsafeAddr())) // :(((
+// Serve starts a new benchmark server using the benchmarks contained in m
+// if the test.benchserve flag is set. Otherwise, Serve is a no-op.
+// Serve should only be used in packages that already have a custom TestMain function;
+// most package should use Main instead.
+// To use Serve, call it from TestMain after calling flag.Parse, after any required
+// benchmarking setup has completed, but before any tests or benchmarks have been run.
+// For example:
+//
+// 	func TestMain(m *testing.M) {
+// 		flag.Parse()
+//  	// do any setup that is necessary for benchmarking
+// 		benchserve.Serve() // if flag is set, does not return; if flag is not set, no-op
+// 		// run tests, etc.
+// 	}
+func Serve(m *testing.M) {
+	if !*benchserve {
+		return
+	}
+	newServer(m).serve()
+	os.Exit(0)
 }
 
 type server struct {
 	benchmarks []testing.InternalBenchmark
 	benchmem   bool
+}
+
+func newServer(m *testing.M) *server {
+	v := reflect.ValueOf(m).Elem().FieldByName("benchmarks")
+	benchmarks := *(*[]testing.InternalBenchmark)(unsafe.Pointer(v.UnsafeAddr())) // :(((
+
+	s := server{benchmarks: benchmarks}
+	return &s
 }
 
 func (s *server) serve() {
