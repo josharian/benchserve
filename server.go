@@ -1,9 +1,9 @@
-// Package benchserve provides a simple line-oriented benchmark server.
+// Package benchserve provides a simple benchmark server.
 //
-// It is designed to allow an external program to drive the benchmarks
-// found in a compiled test binary.
+// It is designed to allow an external program to drive
+// the benchmarks in a compiled test binary.
 //
-// The protocol is still under development and may change.
+// The API and protocol is still under development and may change.
 //
 // To enable benchserve with a package, add this somewhere to your
 // package's tests:
@@ -14,77 +14,45 @@
 // 		benchserve.Main(m)
 // 	}
 //
-// Your existing tests and benchmarks should operate unchanged.
+// Your existing tests and benchmarks will operate unchanged.
 // To use benchserve, compile the tests with 'go test -c',
 // and then execute with the -test.benchserve flag,
 // e.g. './foo.test -test.benchserve'.
-// This will bypass all tests and benchmarks, and ignore all other
+// This will bypass all tests and benchmarks and ignore all other
 // flags, including the usual benchmarking and profiling flags,
-// and instead start a benchmark server.
-// The benchmark server accepts commands in stdin, prints output
-// on stdout, and prints errors on stderr.
+// and instead start the benchmark server.
 //
-// It is designed to be invoked and driven by another program,
-// but you can take a quick tour by hand. Here is a sample session:
+// The benchmark server uses JSON-RPC.
+// By default, it listens on :52525. Use the -test.benchserve.addr
+// flag to set a different host:port.
+// The server only serves a single request at a time.
+// Serving requests concurrency could skew benchmark results.
 //
-// 	$ cd $GOROOT/src/encoding/json
-// 	$ go test -c
-// 	$ ./json.test -test.benchserve
-// 	help
-// 	commands: help, list, run, set, quit, exit
-// 	list
-// 	BenchmarkCodeEncoder
-// 	BenchmarkCodeMarshal
-// 	BenchmarkCodeDecoder
-// 	BenchmarkCodeUnmarshal
-// 	BenchmarkCodeUnmarshalReuse
-// 	BenchmarkUnmarshalString
-// 	BenchmarkUnmarshalFloat64
-// 	BenchmarkUnmarshalInt64
-// 	BenchmarkSkipValue
-// 	BenchmarkEncoderEncode
-//
-// 	run BenchmarkCodeEncoder 100
-// 	BenchmarkCodeEncoder	     100	  17719109 ns/op	 109.51 MB/s
-// 	set benchmem true
-// 	run BenchmarkCodeEncoder 100
-// 	BenchmarkCodeEncoder	     100	  17974625 ns/op	 107.96 MB/s	   45953 B/op	       1 allocs/op
-// 	run BenchmarkCodeEncoder-4 100
-// 	BenchmarkCodeEncoder-4	     100	  18031952 ns/op	 107.61 MB/s	   45979 B/op	       1 allocs/op
-// 	exit
-// 	$
-//
-// The github.com/josharian/benchserve/benchcli package is a Go client
-// for benchserve.
-//
-// The decision to use a simple, line-oriented server using pipes is intentional.
-// This enables benchserve to rely only on the same set of packages that
-// the testing package does, which means that it is usable with any package
-// without introducing circular imports. Using (say) net/http or net/rpc or
-// even just net would cause benchserve to be unsuitable for use with
-// many packages in the standard library.
-//
-// Benchserve relies on unexported details of the testing package, which may
-// change at any time. A request to officially support this functionality
-// is https://golang.org/issue/10930.
+// Benchserve relies on unexported details of the testing package,
+// which may change at any time. A request to officially support
+// this functionality is https://golang.org/issue/10930.
 package benchserve
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
+	"log"
+	"net"
+	"net/rpc"
+	"net/rpc/jsonrpc"
 	"os"
 	"reflect"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 	"unsafe"
 )
 
-var benchserve = flag.Bool("test.benchserve", false, "run an interactive benchmark server")
+var (
+	benchServe     = flag.Bool("test.benchserve", false, "run a JSON-RPC benchmark server")
+	benchServeAddr = flag.String("test.benchserve.addr", ":52525", "`host:port` for the JSON-RPC benchmark server")
+)
 
 // Main runs a test binary.
 // To incorporate benchserve into your package,
@@ -103,8 +71,10 @@ func Main(m *testing.M) {
 
 // Serve starts a new benchmark server using the benchmarks contained in m
 // if the test.benchserve flag is set. Otherwise, Serve is a no-op.
-// Serve should only be used in packages that already have a custom TestMain function;
-// most package should use Main instead.
+//
+// Serve should only be used in packages that already have a custom TestMain function.
+// Most packages should use Main instead.
+//
 // To use Serve, call it from TestMain after calling flag.Parse, after any required
 // benchmarking setup has completed, but before any tests or benchmarks have been run.
 // For example:
@@ -116,164 +86,127 @@ func Main(m *testing.M) {
 // 		// run tests, etc.
 // 	}
 func Serve(m *testing.M) {
-	if !*benchserve {
+	if !*benchServe {
 		return
 	}
 	newServer(m).serve()
 	os.Exit(0)
 }
 
-type server struct {
-	benchmarks []testing.InternalBenchmark
-	benchmem   bool
+// Server is a benchmark server.
+// It handles JSON-RPC requests.
+type Server struct {
+	m   map[string]testing.InternalBenchmark
+	opt Options
 }
 
-func newServer(m *testing.M) *server {
+// Options control benchmarking behavior.
+type Options struct {
+	Benchmem bool // equivalent to -test.benchmem
+}
+
+// Run requests a single benchmark run.
+type Run struct {
+	Name  string // name of the benchmark to run
+	Procs int    // GOMAXPROCS value, equivalent to -test.cpu
+	N     int    // number of iterations to run, equivalent to b.N
+}
+
+// Result is the result of a single benchmark run.
+type Result struct {
+	testing.BenchmarkResult
+
+	// ReportAllocs reports whether allocations should be reported for this run.
+	// This might be set as a result of the current Options
+	// or because the benchmark called b.ReportAllocs.
+	ReportAllocs bool
+
+	// failed reports whether the benchmark run failed.
+	failed bool
+}
+
+func newServer(m *testing.M) *Server {
 	v := reflect.ValueOf(m).Elem().FieldByName("benchmarks")
 	benchmarks := *(*[]testing.InternalBenchmark)(unsafe.Pointer(v.UnsafeAddr())) // :(((
 
-	s := server{benchmarks: benchmarks}
-	return &s
-}
-
-func (s *server) serve() {
-	cmds := map[string]func([]string){
-		"help": s.cmdHelp,
-		"quit": s.cmdQuit,
-		"exit": s.cmdQuit,
-		"list": s.cmdList,
-		"run":  s.cmdRun,
-		"set":  s.cmdSet,
-	}
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) == 0 {
-			s.cmdHelp(nil)
-			continue
-		}
-		cmd := cmds[fields[0]]
-		if cmd == nil {
-			s.cmdHelp(nil)
-			continue
-		}
-		cmd(fields[1:])
-	}
-	if err := scanner.Err(); err != nil {
-		fmt.Println(err)
-		os.Exit(2)
-	}
-}
-
-func (s *server) cmdHelp([]string) {
-	fmt.Fprintln(os.Stderr, "commands: help, list, run, set, quit, exit")
-}
-
-func (s *server) cmdQuit([]string) {
-	os.Exit(0)
-}
-
-func (s *server) cmdList([]string) {
-	for _, b := range s.benchmarks {
-		fmt.Println(b.Name)
-	}
-	fmt.Println()
-}
-
-func (s *server) cmdSet(args []string) {
-	// TODO: What else is worth setting?
-	if len(args) < 2 || args[0] != "benchmem" {
-		fmt.Fprintln(os.Stderr, "set benchmem <bool>")
-		return
-	}
-	b, err := strconv.ParseBool(args[1])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "bad benchmem value:", err)
-		return
-	}
-	s.benchmem = b
-}
-
-func (s *server) cmdRun(args []string) {
-	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "run <name>[-cpu] <iterations>")
-		return
-	}
-
-	name := args[0]
-	procs := 1
-	if i := strings.IndexByte(name, '-'); i != -1 {
-		var err error
-		procs, err = strconv.Atoi(name[i+1:])
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "bad cpu value:", err)
-			return
-		}
-		name = name[:i]
-	}
-
-	var bench testing.InternalBenchmark
-	for _, x := range s.benchmarks {
-		if x.Name == name {
-			bench = x
+	s := Server{m: make(map[string]testing.InternalBenchmark)}
+	for _, b := range benchmarks {
+		if _, ok := s.m[b.Name]; ok {
 			// It is possible to define a benchmark with the same name
 			// twice in a single test binary, by defining it once
 			// in a regular test package and once in an external test package.
-			// If you do that, you probably deserve what happens to you now,
-			// namely that we run one of the two, but no guarantees which.
-			// If someday we combine multiple packages into a single
-			// test binary, then we'll probably need to invoke benchmarks
-			// by index rather than by name.
-			break
+			// Don't do that.
+			log.Fatalf("found two benchmarks named %s", b.Name)
 		}
-	}
-	if bench.Name == "" {
-		fmt.Fprintln(os.Stderr, "benchmark not found:", name)
-		return
+		s.m[b.Name] = b
 	}
 
-	iters, err := strconv.Atoi(args[1])
-	if err != nil || iters <= 0 {
-		fmt.Fprintf(os.Stderr, "iterations must be positive, got %v\n", iters)
-		return
-	}
+	return &s
+}
 
-	benchName := benchmarkName(bench.Name, procs)
-	fmt.Print(benchName, "\t")
+// Serve starts the server. It blocks.
+func (s *Server) serve() {
+	rpc.Register(s)
 
-	runtime.GOMAXPROCS(procs)
-	r := runBenchmark(bench, iters)
+	l, err := net.Listen("tcp", *benchServeAddr)
+	if err != nil {
+		log.Fatalf("listen %v: %v", *benchServeAddr, err)
+	}
+	defer l.Close()
 
-	if r.Failed {
-		fmt.Fprintln(os.Stderr, "--- FAIL:", benchName)
-		return
-	}
-	fmt.Print(r.BenchmarkResult)
-	if s.benchmem || r.ShowAllocResult {
-		fmt.Print("\t", r.MemString())
-	}
-	fmt.Println()
-	if p := runtime.GOMAXPROCS(-1); p != procs {
-		fmt.Fprintf(os.Stderr, "testing: %s left GOMAXPROCS set to %d\n", benchName, p)
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			log.Fatalf("accept: %v", err)
+		}
+		jsonrpc.ServeConn(conn)
+		conn.Close()
 	}
 }
 
-// benchmarkName returns full name of benchmark including procs suffix.
-func benchmarkName(name string, n int) string {
-	if n != 1 {
-		return fmt.Sprintf("%s-%d", name, n)
+// List returns an unordered list of the available benchmark names.
+func (s *Server) List(args struct{}, names *[]string) error {
+	for _, b := range s.m {
+		*names = append(*names, b.Name)
 	}
-	return name
+	return nil
 }
 
-type result struct {
-	testing.BenchmarkResult
-	Failed          bool
-	ShowAllocResult bool
+// Kill stops the benchmark server and its process.
+func (s *Server) Kill(args struct{}, reply *struct{}) error {
+	os.Exit(0)
+	return nil
+}
+
+// Set sets the server's Options.
+func (s *Server) Set(args Options, reply *struct{}) error {
+	s.opt = args
+	return nil
+}
+
+// Run runs a single benchmark.
+func (s *Server) Run(args Run, reply *Result) error {
+	b, ok := s.m[args.Name]
+	if !ok {
+		return fmt.Errorf("%s not found", args.Name)
+	}
+
+	runtime.GOMAXPROCS(args.Procs)
+	*reply = runBenchmark(b, args.N)
+
+	if reply.failed {
+		return fmt.Errorf("%s failed", args.Name)
+	}
+
+	if p := runtime.GOMAXPROCS(-1); p != args.Procs {
+		return fmt.Errorf("%s left GOMAXPROCS set to %d\n", b.Name, p)
+	}
+
+	return nil
 }
 
 // runBenchmark runs b for the specified number of iterations.
-func runBenchmark(b testing.InternalBenchmark, n int) result {
+func runBenchmark(b testing.InternalBenchmark, n int) Result {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	tb := testing.B{N: n}
@@ -281,7 +214,6 @@ func runBenchmark(b testing.InternalBenchmark, n int) result {
 
 	go func() {
 		defer wg.Done()
-
 		// Try to get a comparable environment for each run
 		// by clearing garbage from previous runs.
 		runtime.GC()
@@ -293,13 +225,13 @@ func runBenchmark(b testing.InternalBenchmark, n int) result {
 	wg.Wait()
 
 	v := reflect.ValueOf(tb)
-	var r result
+	var r Result
 	r.N = n
 	r.T = time.Duration(v.FieldByName("duration").Int())
 	r.Bytes = v.FieldByName("bytes").Int()
 	r.MemAllocs = v.FieldByName("netAllocs").Uint()
 	r.MemBytes = v.FieldByName("netBytes").Uint()
-	r.Failed = v.FieldByName("failed").Bool()
-	r.ShowAllocResult = v.FieldByName("showAllocResult").Bool()
+	r.ReportAllocs = v.FieldByName("showAllocResult").Bool()
+	r.failed = v.FieldByName("failed").Bool()
 	return r
 }
